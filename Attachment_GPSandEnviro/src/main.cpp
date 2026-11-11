@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
@@ -7,6 +9,12 @@
 
 const char *WIFI_SSID = "MyLight";
 const char *WIFI_PASS = "12345678";
+
+// Name on the network: open http://gpsenviro.local (or the IP address that
+// is printed on the USB serial monitor at start-up).
+const char *HOSTNAME = "gpsenviro";
+
+WebServer server(80);
 
 Adafruit_BME680 bme;
 static bool bmeOk = false;
@@ -25,7 +33,7 @@ static const uint32_t GPS_BAUD = 9600;
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
 
-// How often a combined GPS + environment record is sent over USB-C.
+// How often a combined GPS + environment record is taken.
 static const unsigned long REPORT_INTERVAL_MS = 3000;
 
 // Reads all bytes waiting from the GPS and passes them to the NMEA parser.
@@ -156,10 +164,13 @@ AirQuality calculateAirQuality()
 }
 
 // ---------------------------------------------------------------------------
-// USB-C output
+// Reports
 // ---------------------------------------------------------------------------
-// Each report is one line of JSON, so a program on the computer can read it
-// line by line. Values that aren't available yet are sent as null.
+// Each report is a JSON object. Values that aren't available yet are null.
+// The latest report is served over WiFi at /data.
+
+static String latestReport = "{}";
+static String latestError = "";
 
 static void addField(String &out, const char *key, const String &value)
 {
@@ -181,7 +192,7 @@ static String quoted(const char *value)
   return String("\"") + value + "\"";
 }
 
-void sendReport(const AirQuality &aq)
+String buildReport(const AirQuality &aq)
 {
   String out = "{";
 
@@ -215,9 +226,74 @@ void sendReport(const AirQuality &aq)
   addField(out, "gas_kohm", num(aq.gasKOhms, 2, envValid));
   addField(out, "iaq", num(aq.iaq, 0, aq.valid));
   addField(out, "iaq_rating", quoted(aq.rating));
+  addField(out, "error", latestError.length() ? quoted(latestError.c_str()) : String("null"));
 
   out += '}';
-  Serial.println(out);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// WiFi
+// ---------------------------------------------------------------------------
+
+// Small page that shows the live readings in a browser.
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS &amp; Environment</title>
+<style>body{font-family:sans-serif;margin:16px}td{padding:4px 12px 4px 0}td:first-child{color:#666}</style>
+</head><body><h1>GPS &amp; Environment</h1><table id="t"></table>
+<script>
+async function update(){
+  try{
+    const d=await (await fetch('/data')).json();
+    document.getElementById('t').innerHTML=Object.entries(d)
+      .map(([k,v])=>`<tr><td>${k}</td><td>${v===null?'&ndash;':v}</td></tr>`).join('');
+  }catch(e){}
+}
+update();setInterval(update,3000);
+</script></body></html>)HTML";
+
+void handleRoot()
+{
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleData()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", latestReport);
+}
+
+void startWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  // Wait up to 15 s for the first connection; after that it keeps retrying
+  // in the background while GPS and sensor readings carry on.
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
+  {
+    updateGPS();
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("WiFi connected: http://%s/ (http://%s.local/)\n",
+                  WiFi.localIP().toString().c_str(), HOSTNAME);
+  else
+    Serial.println("WiFi not connected yet, still trying...");
+
+  MDNS.begin(HOSTNAME);
+  MDNS.addService("http", "tcp", 80);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
 }
 
 void setup()
@@ -247,8 +323,11 @@ void setup()
   }
   else
   {
-    Serial.println("{\"error\":\"BME680 not found, check wiring\"}");
+    latestError = "BME680 not found, check wiring";
+    Serial.println(latestError);
   }
+
+  startWiFi();
 }
 
 void loop()
@@ -257,11 +336,22 @@ void loop()
   static bool gpsWarningSent = false;
 
   updateGPS();
+  server.handleClient();
+
+  // Print the address again whenever WiFi (re)connects.
+  static bool wasConnected = WiFi.status() == WL_CONNECTED;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !wasConnected)
+    Serial.printf("WiFi connected: http://%s/\n", WiFi.localIP().toString().c_str());
+  wasConnected = connected;
 
   // No NMEA data at all after 5 s means the GPS is not wired or powered.
   if (!gpsWarningSent && millis() > 5000 && gps.charsProcessed() < 10)
   {
-    Serial.println("{\"error\":\"No data from GPS, check wiring\"}");
+    if (latestError.length())
+      latestError += "; ";
+    latestError += "No data from GPS, check wiring";
+    Serial.println(latestError);
     gpsWarningSent = true;
   }
 
@@ -270,6 +360,7 @@ void loop()
     lastReport = millis();
     AirQuality aq = calculateAirQuality();
     updateGPS();
-    sendReport(aq);
+    latestReport = buildReport(aq);
+    Serial.println(latestReport); // also printed on USB for debugging
   }
 }
