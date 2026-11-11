@@ -3,11 +3,38 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <TinyGPSPlus.h>
 
 const char *WIFI_SSID = "MyLight";
 const char *WIFI_PASS = "12345678";
 
 Adafruit_BME680 bme;
+static bool bmeOk = false;
+
+// ---------------------------------------------------------------------------
+// GPS (ATGM336H)
+// ---------------------------------------------------------------------------
+// The ATGM336H sends NMEA sentences over UART at 9600 baud by default.
+// Wiring: GPS TX -> GPS_RX_PIN, GPS RX -> GPS_TX_PIN, VCC -> 3V3, GND -> GND.
+// USB-C (Serial) is the ESP32-C3's built-in USB CDC port, so the hardware
+// UART pins are free for the GPS.
+static const int GPS_RX_PIN = 20; // ESP32 receives on this pin
+static const int GPS_TX_PIN = 21; // ESP32 transmits on this pin
+static const uint32_t GPS_BAUD = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
+
+// How often a combined GPS + environment record is sent over USB-C.
+static const unsigned long REPORT_INTERVAL_MS = 3000;
+
+// Reads all bytes waiting from the GPS and passes them to the NMEA parser.
+// Call this as often as possible so the UART buffer never overflows.
+void updateGPS()
+{
+  while (GPSSerial.available() > 0)
+    gps.encode(GPSSerial.read());
+}
 
 // ---------------------------------------------------------------------------
 // Air quality
@@ -63,6 +90,12 @@ AirQuality calculateAirQuality()
   AirQuality aq = {};
   aq.valid = false;
   aq.rating = "Unknown";
+
+  if (!bmeOk)
+  {
+    aq.rating = "Sensor not found";
+    return aq;
+  }
 
   if (!bme.performReading())
   {
@@ -122,40 +155,121 @@ AirQuality calculateAirQuality()
   return aq;
 }
 
+// ---------------------------------------------------------------------------
+// USB-C output
+// ---------------------------------------------------------------------------
+// Each report is one line of JSON, so a program on the computer can read it
+// line by line. Values that aren't available yet are sent as null.
+
+static void addField(String &out, const char *key, const String &value)
+{
+  if (out.length() > 1)
+    out += ',';
+  out += '"';
+  out += key;
+  out += "\":";
+  out += value;
+}
+
+static String num(double value, int decimals, bool valid)
+{
+  return valid ? String(value, decimals) : String("null");
+}
+
+static String quoted(const char *value)
+{
+  return String("\"") + value + "\"";
+}
+
+void sendReport(const AirQuality &aq)
+{
+  String out = "{";
+
+  // GPS
+  char timeStr[25];
+  bool timeValid = gps.date.isValid() && gps.time.isValid() && gps.date.year() > 2000;
+  if (timeValid)
+    snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+
+  bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  addField(out, "ms", String(millis()));
+  addField(out, "utc", timeValid ? quoted(timeStr) : String("null"));
+  addField(out, "fix", fix ? "true" : "false");
+  addField(out, "lat", num(gps.location.lat(), 6, fix));
+  addField(out, "lon", num(gps.location.lng(), 6, fix));
+  addField(out, "alt_m", num(gps.altitude.meters(), 1, fix && gps.altitude.isValid()));
+  addField(out, "speed_kmh", num(gps.speed.kmph(), 2, fix && gps.speed.isValid()));
+  addField(out, "course_deg", num(gps.course.deg(), 1, fix && gps.course.isValid()));
+  addField(out, "sats", gps.satellites.isValid() ? String(gps.satellites.value()) : String("null"));
+  addField(out, "hdop", num(gps.hdop.hdop(), 2, gps.hdop.isValid()));
+  addField(out, "gps_chars", String(gps.charsProcessed()));
+  addField(out, "gps_bad_checksums", String(gps.failedChecksum()));
+
+  // Environment
+  bool envValid = bmeOk && strcmp(aq.rating, "Sensor read failed") != 0;
+  addField(out, "temp_c", num(aq.temperature, 2, envValid));
+  addField(out, "humidity_pct", num(aq.humidity, 2, envValid));
+  addField(out, "pressure_hpa", num(aq.pressure, 2, envValid));
+  addField(out, "gas_kohm", num(aq.gasKOhms, 2, envValid));
+  addField(out, "iaq", num(aq.iaq, 0, aq.valid));
+  addField(out, "iaq_rating", quoted(aq.rating));
+
+  out += '}';
+  Serial.println(out);
+}
+
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
+  // GPS UART. A larger receive buffer stops NMEA data being lost while the
+  // BME680 reading blocks the loop for a few hundred milliseconds.
+  GPSSerial.setRxBufferSize(1024);
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
   // Uses the board's default I2C pins (SDA = GPIO8, SCL = GPIO9 on the
   // ESP32-C3-DevKitM-1). Use Wire.begin(SDA, SCL) if wired differently.
   Wire.begin();
 
-  // Most breakout boards use 0x77; some use 0x76.
-  if (!bme.begin(0x77) && !bme.begin(0x76))
+  // Most breakout boards use 0x77; some use 0x76. If the sensor is missing,
+  // keep running so GPS data is still sent.
+  bmeOk = bme.begin(0x77) || bme.begin(0x76);
+  if (bmeOk)
   {
-    Serial.println("Could not find a BME680 sensor, check wiring!");
-    while (true)
-      delay(1000);
+    bme.setTemperatureOversampling(BME680_OS_8X);
+    bme.setHumidityOversampling(BME680_OS_2X);
+    bme.setPressureOversampling(BME680_OS_4X);
+    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+    bme.setGasHeater(320, 150); // 320 C for 150 ms
   }
-
-  bme.setTemperatureOversampling(BME680_OS_8X);
-  bme.setHumidityOversampling(BME680_OS_2X);
-  bme.setPressureOversampling(BME680_OS_4X);
-  bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  bme.setGasHeater(320, 150); // 320 C for 150 ms
+  else
+  {
+    Serial.println("{\"error\":\"BME680 not found, check wiring\"}");
+  }
 }
 
 void loop()
 {
-  AirQuality aq = calculateAirQuality();
+  static unsigned long lastReport = 0;
+  static bool gpsWarningSent = false;
 
-  Serial.printf("T: %.2f C  RH: %.2f %%  P: %.2f hPa  Gas: %.2f kOhm  ",
-                aq.temperature, aq.humidity, aq.pressure, aq.gasKOhms);
-  if (aq.valid)
-    Serial.printf("IAQ: %.0f (%s)\n", aq.iaq, aq.rating);
-  else
-    Serial.printf("IAQ: -- (%s)\n", aq.rating);
+  updateGPS();
 
-  delay(3000);
+  // No NMEA data at all after 5 s means the GPS is not wired or powered.
+  if (!gpsWarningSent && millis() > 5000 && gps.charsProcessed() < 10)
+  {
+    Serial.println("{\"error\":\"No data from GPS, check wiring\"}");
+    gpsWarningSent = true;
+  }
+
+  if (millis() - lastReport >= REPORT_INTERVAL_MS)
+  {
+    lastReport = millis();
+    AirQuality aq = calculateAirQuality();
+    updateGPS();
+    sendReport(aq);
+  }
 }
