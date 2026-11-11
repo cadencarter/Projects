@@ -10,8 +10,8 @@
 // ---- Settings ----
 #define USE_ACCESS_POINT true // true: ESP32 makes its own network. false: joins your router.
 
-const char *AP_SSID = "MyLight";
-const char *AP_PASS = "12345678"; // at least 8 characters
+const char *AP_SSID = "SSID";
+const char *AP_PASS = "password"; // at least 8 characters
 
 const char *WIFI_SSID = "your_ssid"; // only used when USE_ACCESS_POINT is false
 const char *WIFI_PASS = "your_password";
