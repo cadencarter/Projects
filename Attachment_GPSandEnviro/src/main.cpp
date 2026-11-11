@@ -7,8 +7,9 @@
 #include <Adafruit_BME680.h>
 #include <TinyGPSPlus.h>
 
-const char *WIFI_SSID = "MyLight";
-const char *WIFI_PASS = "12345678";
+// WIFI_SSID and WIFI_PASS. This file is not committed; copy
+// include/WiFi_Info.example.h to include/WiFi_Info.h and fill it in.
+#include "WiFi_Info.h"
 
 // Name on the network: open http://gpsenviro.local (or the IP address that
 // is printed on the USB serial monitor at start-up).
@@ -69,8 +70,8 @@ struct AirQuality
   float gasKOhms;     // gas resistance in kOhms
 };
 
-static const float HUM_REFERENCE = 40.0f;           // ideal relative humidity (%)
-static const float HUM_WEIGHT = 0.25f;              // humidity share of the score
+static const float HUM_REFERENCE = 40.0f;                    // ideal relative humidity (%)
+static const float HUM_WEIGHT = 0.25f;                       // humidity share of the score
 static const unsigned long BURN_IN_MS = 5UL * 60UL * 1000UL; // 5 minutes
 
 static float gasBaseline = 0.0f;
@@ -81,12 +82,18 @@ static bool burnInDone = false;
 
 static const char *iaqRating(float iaq)
 {
-  if (iaq <= 50)  return "Excellent";
-  if (iaq <= 100) return "Good";
-  if (iaq <= 150) return "Lightly polluted";
-  if (iaq <= 200) return "Moderately polluted";
-  if (iaq <= 250) return "Heavily polluted";
-  if (iaq <= 350) return "Severely polluted";
+  if (iaq <= 50)
+    return "Excellent";
+  if (iaq <= 100)
+    return "Good";
+  if (iaq <= 150)
+    return "Lightly polluted";
+  if (iaq <= 200)
+    return "Moderately polluted";
+  if (iaq <= 250)
+    return "Heavily polluted";
+  if (iaq <= 350)
+    return "Severely polluted";
   return "Hazardous";
 }
 
