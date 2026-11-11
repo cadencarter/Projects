@@ -8,4 +8,4 @@
 .vscode/ipch
 
 # Secrets
-include/WiFi_Info.h
+**/include/WiFi_Info.h

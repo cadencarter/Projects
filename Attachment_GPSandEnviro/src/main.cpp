@@ -1,11 +1,38 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
 #include "WiFi_Info.h"
 
 Adafruit_BME680 bme;
+static bool bmeOk = false;
+
+// ---------------------------------------------------------------------------
+// GPS (ATGM336H)
+// ---------------------------------------------------------------------------
+// The ATGM336H sends NMEA sentences over UART at 9600 baud by default.
+// Wiring: GPS TX -> GPS_RX_PIN, GPS RX -> GPS_TX_PIN, VCC -> 3V3, GND -> GND.
+// USB-C (Serial) is the ESP32-C3's built-in USB CDC port, so the hardware
+// UART pins are free for the GPS.
+static const int GPS_RX_PIN = 20; // ESP32 receives on this pin
+static const int GPS_TX_PIN = 21; // ESP32 transmits on this pin
+static const uint32_t GPS_BAUD = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
+
+// How often a combined GPS + environment record is taken.
+static const unsigned long REPORT_INTERVAL_MS = 3000;
+
+// Reads all bytes waiting from the GPS and passes them to the NMEA parser.
+// Call this as often as possible so the UART buffer never overflows.
+void updateGPS()
+{
+  while (GPSSerial.available() > 0)
+    gps.encode(GPSSerial.read());
+}
 
 // ---------------------------------------------------------------------------
 // Air quality
@@ -68,6 +95,12 @@ AirQuality calculateAirQuality()
   aq.valid = false;
   aq.rating = "Unknown";
 
+  if (!bmeOk)
+  {
+    aq.rating = "Sensor not found";
+    return aq;
+  }
+
   if (!bme.performReading())
   {
     aq.rating = "Sensor read failed";
@@ -126,40 +159,187 @@ AirQuality calculateAirQuality()
   return aq;
 }
 
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+// Each report is a JSON object. Values that aren't available yet are null.
+// Each report is sent to the receiving ESP32 over WiFi.
+
+static uint32_t reportCount = 0;
+static String latestError = "";
+
+static void addField(String &out, const char *key, const String &value)
+{
+  if (out.length() > 1)
+    out += ',';
+  out += '"';
+  out += key;
+  out += "\":";
+  out += value;
+}
+
+static String num(double value, int decimals, bool valid)
+{
+  return valid ? String(value, decimals) : String("null");
+}
+
+static String quoted(const char *value)
+{
+  return String("\"") + value + "\"";
+}
+
+String buildReport(const AirQuality &aq)
+{
+  String out = "{";
+
+  // GPS
+  char timeStr[25];
+  bool timeValid = gps.date.isValid() && gps.time.isValid() && gps.date.year() > 2000;
+  if (timeValid)
+    snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+
+  bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  addField(out, "seq", String(reportCount++)); // lets the receiver spot lost packets
+  addField(out, "ms", String(millis()));
+  addField(out, "utc", timeValid ? quoted(timeStr) : String("null"));
+  addField(out, "fix", fix ? "true" : "false");
+  addField(out, "lat", num(gps.location.lat(), 6, fix));
+  addField(out, "lon", num(gps.location.lng(), 6, fix));
+  addField(out, "alt_m", num(gps.altitude.meters(), 1, fix && gps.altitude.isValid()));
+  addField(out, "speed_kmh", num(gps.speed.kmph(), 2, fix && gps.speed.isValid()));
+  addField(out, "course_deg", num(gps.course.deg(), 1, fix && gps.course.isValid()));
+  addField(out, "sats", gps.satellites.isValid() ? String(gps.satellites.value()) : String("null"));
+  addField(out, "hdop", num(gps.hdop.hdop(), 2, gps.hdop.isValid()));
+  addField(out, "gps_chars", String(gps.charsProcessed()));
+  addField(out, "gps_bad_checksums", String(gps.failedChecksum()));
+
+  // Environment
+  bool envValid = bmeOk && strcmp(aq.rating, "Sensor read failed") != 0;
+  addField(out, "temp_c", num(aq.temperature, 2, envValid));
+  addField(out, "humidity_pct", num(aq.humidity, 2, envValid));
+  addField(out, "pressure_hpa", num(aq.pressure, 2, envValid));
+  addField(out, "gas_kohm", num(aq.gasKOhms, 2, envValid));
+  addField(out, "iaq", num(aq.iaq, 0, aq.valid));
+  addField(out, "iaq_rating", quoted(aq.rating));
+  addField(out, "error", latestError.length() ? quoted(latestError.c_str()) : String("null"));
+
+  out += '}';
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// WiFi
+// ---------------------------------------------------------------------------
+
+// Connects to the receiving ESP32's access point. Waits up to 15 s for the
+// first connection; after that it keeps retrying in the background while GPS
+// and sensor readings carry on.
+void startWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
+  {
+    updateGPS();
+    delay(100);
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+    Serial.println("WiFi not connected yet, still trying...");
+}
+
+// Sends one report to the receiving ESP32. Returns false if WiFi is down or
+// the packet could not be sent. UDP doesn't wait for a reply, so a slow or
+// missing receiver never holds up the GPS.
+bool sendToReceiver(const String &report)
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  IPAddress receiver = WiFi.gatewayIP();
+  if (!udp.beginPacket(receiver, RECEIVER_PORT))
+    return false;
+  udp.write((const uint8_t *)report.c_str(), report.length());
+  return udp.endPacket() == 1;
+}
+
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
+  // GPS UART. A larger receive buffer stops NMEA data being lost while the
+  // BME680 reading blocks the loop for a few hundred milliseconds.
+  GPSSerial.setRxBufferSize(1024);
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
   // Uses the board's default I2C pins (SDA = GPIO8, SCL = GPIO9 on the
   // ESP32-C3-DevKitM-1). Use Wire.begin(SDA, SCL) if wired differently.
   Wire.begin();
 
-  // Most breakout boards use 0x77; some use 0x76.
-  if (!bme.begin(0x77) && !bme.begin(0x76))
+  // Most breakout boards use 0x77; some use 0x76. If the sensor is missing,
+  // keep running so GPS data is still sent.
+  bmeOk = bme.begin(0x77) || bme.begin(0x76);
+  if (bmeOk)
   {
-    Serial.println("Could not find a BME680 sensor, check wiring!");
-    while (true)
-      delay(1000);
+    bme.setTemperatureOversampling(BME680_OS_8X);
+    bme.setHumidityOversampling(BME680_OS_2X);
+    bme.setPressureOversampling(BME680_OS_4X);
+    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+    bme.setGasHeater(320, 150); // 320 C for 150 ms
+  }
+  else
+  {
+    latestError = "BME680 not found, check wiring";
+    Serial.println(latestError);
   }
 
-  bme.setTemperatureOversampling(BME680_OS_8X);
-  bme.setHumidityOversampling(BME680_OS_2X);
-  bme.setPressureOversampling(BME680_OS_4X);
-  bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  bme.setGasHeater(320, 150); // 320 C for 150 ms
+  startWiFi();
 }
 
 void loop()
 {
-  AirQuality aq = calculateAirQuality();
+  static unsigned long lastReport = 0;
+  static bool gpsWarningSent = false;
 
-  Serial.printf("T: %.2f C  RH: %.2f %%  P: %.2f hPa  Gas: %.2f kOhm  ",
-                aq.temperature, aq.humidity, aq.pressure, aq.gasKOhms);
-  if (aq.valid)
-    Serial.printf("IAQ: %.0f (%s)\n", aq.iaq, aq.rating);
-  else
-    Serial.printf("IAQ: -- (%s)\n", aq.rating);
+  updateGPS();
 
-  delay(3000);
+  // Log WiFi connects and drops on the USB serial monitor.
+  static bool wasConnected = false;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected != wasConnected)
+  {
+    if (connected)
+      Serial.printf("WiFi connected to %s, sending to %s:%u\n", WIFI_SSID,
+                    WiFi.gatewayIP().toString().c_str(), RECEIVER_PORT);
+    else
+      Serial.println("WiFi disconnected, reconnecting...");
+    wasConnected = connected;
+  }
+
+  // No NMEA data at all after 5 s means the GPS is not wired or powered.
+  if (!gpsWarningSent && millis() > 5000 && gps.charsProcessed() < 10)
+  {
+    if (latestError.length())
+      latestError += "; ";
+    latestError += "No data from GPS, check wiring";
+    Serial.println(latestError);
+    gpsWarningSent = true;
+  }
+
+  if (millis() - lastReport >= REPORT_INTERVAL_MS)
+  {
+    lastReport = millis();
+    AirQuality aq = calculateAirQuality();
+    updateGPS();
+    String report = buildReport(aq);
+    bool sent = sendToReceiver(report);
+    Serial.print(sent ? "Sent: " : "Not sent: "); // USB log for debugging
+    Serial.println(report);
+  }
 }
