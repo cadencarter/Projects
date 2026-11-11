@@ -8,18 +8,19 @@
 #define high 1
 #define low 0
 
-// ---- Settings ----
-#define USE_ACCESS_POINT true // true: ESP32 makes its own network. false: joins your router.
-
 const char *AP_SSID = "SSID";
 const char *AP_PASS = "password"; // at least 8 characters
 
-const char *WIFI_SSID = "your_ssid"; // only used when USE_ACCESS_POINT is false
-const char *WIFI_PASS = "your_password";
-// ------------------
-
 WebServer server(80);
-bool ledState = false;
+
+// ---- Light attachment ----
+// The lamp has one button that steps through its modes in this order, back
+// to Off after the last one (the page uses the same order):
+//   0 Off, 1 Spotlight, 2 Floodlight, 3 Ultra Bright, 4 Red Light, 5 Flashing Red
+// The hub can't read the lamp's mode, so it counts button presses. The count
+// starts at 0 (Off) each time the light attachment is plugged in.
+#define LIGHT_MODES 6
+int lightMode = 0;
 
 // ---- Attachment detection ----
 // Each attachment has an ID resistor from a USB-C pin to GND. The hub has a
@@ -61,12 +62,17 @@ void updateAttachment()
   else
     idResistance = R_REF * mv / (3300.0 - mv);
 
+  const char *previous = attachment;
   if (idResistance > 0 && near(idResistance, R_LIGHT))
     attachment = "light";
   else if (idResistance > 0 && near(idResistance, R_GPS_ENV))
     attachment = "gps_env";
   else
     attachment = "none";
+
+  // A newly plugged-in lamp starts Off.
+  if (attachment != previous && strcmp(attachment, "light") == 0)
+    lightMode = 0;
 }
 
 void receiveReadings()
@@ -114,15 +120,8 @@ void handleStatus()
 }
 
 void handleRoot() { server.send_P(200, "text/html", PAGE); }
-void handleState() { server.send(200, "text/plain", ledState ? "ON" : "OFF"); }
-/*void handleToggle()
-{
-  ledState = !ledState;
-  digitalWrite(togglePin, ledState);
-  server.send(200, "text/plain", ledState ? "ON" : "OFF");
-}
-*/
-// new below
+void handleState() { server.send(200, "text/plain", String(lightMode)); }
+
 #define PRESS_MS 150 // try 100-300 if the lamp doesn't respond
 
 void pressButton()
@@ -135,10 +134,9 @@ void pressButton()
 void handleToggle()
 {
   pressButton();
-  ledState = !ledState;
-  server.send(200, "text/plain", ledState ? "ON" : "OFF");
+  lightMode = (lightMode + 1) % LIGHT_MODES;
+  server.send(200, "text/plain", String(lightMode));
 }
-// new ^^^
 
 void setup()
 {
@@ -147,23 +145,11 @@ void setup()
   digitalWrite(togglePin, LOW);
   analogSetPinAttenuation(ID_PIN, ADC_11db); // measure the full 0-3.3 V range
 
-#if USE_ACCESS_POINT
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("Connect to Wi-Fi '");
   Serial.print(AP_SSID);
   Serial.println("', then open:");
   Serial.println(WiFi.softAPIP()); // 192.168.4.1 by default
-#else
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Open in your browser: ");
-  Serial.println(WiFi.localIP());
-#endif
 
   server.on("/", handleRoot);
   server.on("/toggle", handleToggle);

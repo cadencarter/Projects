@@ -86,7 +86,7 @@ const char PAGE[] PROGMEM = R"rawliteral(
   <div id="light" hidden>
     <div id="lamp" class="lamp"></div>
     <div id="state" aria-live="polite">Unknown</div>
-    <button id="btn">Toggle light</button>
+    <button id="btn">Next light mode</button>
   </div>
 
   <!-- GPS + environment attachment -->
