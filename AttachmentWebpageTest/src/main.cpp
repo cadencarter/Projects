@@ -19,8 +19,14 @@ WebServer server(80);
 //   0 Off, 1 Spotlight, 2 Floodlight, 3 Ultra Bright, 4 Red Light, 5 Flashing Red
 // The hub can't read the lamp's mode, so it counts button presses. The count
 // starts at 0 (Off) each time the light attachment is plugged in.
+//
+// If the button hasn't been pressed for 5 minutes, the lamp's next press
+// turns it Off instead of moving to the next mode. Presses after that step
+// through the modes from Off again.
 #define LIGHT_MODES 6
+const unsigned long LIGHT_TIMEOUT_MS = 5UL * 60UL * 1000UL; // 5 minutes
 int lightMode = 0;
+unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 
 // ---- Attachment detection ----
 // Each attachment has an ID resistor from a USB-C pin to GND. The hub has a
@@ -72,7 +78,10 @@ void updateAttachment()
 
   // A newly plugged-in lamp starts Off.
   if (attachment != previous && strcmp(attachment, "light") == 0)
+  {
     lightMode = 0;
+    lastLightPress = millis();
+  }
 }
 
 void receiveReadings()
@@ -134,7 +143,14 @@ void pressButton()
 void handleToggle()
 {
   pressButton();
-  lightMode = (lightMode + 1) % LIGHT_MODES;
+
+  // 5 minutes or more since the last press: this press turns the lamp Off.
+  if (millis() - lastLightPress >= LIGHT_TIMEOUT_MS)
+    lightMode = 0;
+  else
+    lightMode = (lightMode + 1) % LIGHT_MODES;
+  lastLightPress = millis();
+
   server.send(200, "text/plain", String(lightMode));
 }
 
