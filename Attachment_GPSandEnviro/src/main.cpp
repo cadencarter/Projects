@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include "WiFi_Info.h"
 
 Adafruit_BME680 bme;
 
