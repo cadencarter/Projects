@@ -1,21 +1,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
 #include <TinyGPSPlus.h>
 
-// WIFI_SSID and WIFI_PASS. This file is not committed; copy
-// include/WiFi_Info.example.h to include/WiFi_Info.h and fill it in.
+// WIFI_SSID and WIFI_PASS of the receiving ESP32's access point. This file
+// is not committed; copy include/WiFi_Info.example.h to include/WiFi_Info.h
+// and fill it in.
 #include "WiFi_Info.h"
 
-// Name on the network: open http://gpsenviro.local (or the IP address that
-// is printed on the USB serial monitor at start-up).
-const char *HOSTNAME = "gpsenviro";
+// Readings are sent as UDP packets to the receiving ESP32. It runs the WiFi
+// access point, so it is the gateway of the network this board joins
+// (192.168.4.1 by default) and no IP address needs to be set here.
+// The receiver must listen on this port.
+static const uint16_t RECEIVER_PORT = 4210;
 
-WebServer server(80);
+WiFiUDP udp;
 
 Adafruit_BME680 bme;
 static bool bmeOk = false;
@@ -174,9 +176,9 @@ AirQuality calculateAirQuality()
 // Reports
 // ---------------------------------------------------------------------------
 // Each report is a JSON object. Values that aren't available yet are null.
-// The latest report is served over WiFi at /data.
+// Each report is sent to the receiving ESP32 over WiFi.
 
-static String latestReport = "{}";
+static uint32_t reportCount = 0;
 static String latestError = "";
 
 static void addField(String &out, const char *key, const String &value)
@@ -212,6 +214,7 @@ String buildReport(const AirQuality &aq)
              gps.time.hour(), gps.time.minute(), gps.time.second());
 
   bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  addField(out, "seq", String(reportCount++)); // lets the receiver spot lost packets
   addField(out, "ms", String(millis()));
   addField(out, "utc", timeValid ? quoted(timeStr) : String("null"));
   addField(out, "fix", fix ? "true" : "false");
@@ -243,44 +246,15 @@ String buildReport(const AirQuality &aq)
 // WiFi
 // ---------------------------------------------------------------------------
 
-// Small page that shows the live readings in a browser.
-static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPS &amp; Environment</title>
-<style>body{font-family:sans-serif;margin:16px}td{padding:4px 12px 4px 0}td:first-child{color:#666}</style>
-</head><body><h1>GPS &amp; Environment</h1><table id="t"></table>
-<script>
-async function update(){
-  try{
-    const d=await (await fetch('/data')).json();
-    document.getElementById('t').innerHTML=Object.entries(d)
-      .map(([k,v])=>`<tr><td>${k}</td><td>${v===null?'&ndash;':v}</td></tr>`).join('');
-  }catch(e){}
-}
-update();setInterval(update,3000);
-</script></body></html>)HTML";
-
-void handleRoot()
-{
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-void handleData()
-{
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", latestReport);
-}
-
+// Connects to the receiving ESP32's access point. Waits up to 15 s for the
+// first connection; after that it keeps retrying in the background while GPS
+// and sensor readings carry on.
 void startWiFi()
 {
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  // Wait up to 15 s for the first connection; after that it keeps retrying
-  // in the background while GPS and sensor readings carry on.
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
@@ -288,19 +262,23 @@ void startWiFi()
     delay(100);
   }
 
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("WiFi connected: http://%s/ (http://%s.local/)\n",
-                  WiFi.localIP().toString().c_str(), HOSTNAME);
-  else
+  if (WiFi.status() != WL_CONNECTED)
     Serial.println("WiFi not connected yet, still trying...");
+}
 
-  MDNS.begin(HOSTNAME);
-  MDNS.addService("http", "tcp", 80);
+// Sends one report to the receiving ESP32. Returns false if WiFi is down or
+// the packet could not be sent. UDP doesn't wait for a reply, so a slow or
+// missing receiver never holds up the GPS.
+bool sendToReceiver(const String &report)
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
 
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
-  server.begin();
+  IPAddress receiver = WiFi.gatewayIP();
+  if (!udp.beginPacket(receiver, RECEIVER_PORT))
+    return false;
+  udp.write((const uint8_t *)report.c_str(), report.length());
+  return udp.endPacket() == 1;
 }
 
 void setup()
@@ -343,14 +321,19 @@ void loop()
   static bool gpsWarningSent = false;
 
   updateGPS();
-  server.handleClient();
 
-  // Print the address again whenever WiFi (re)connects.
-  static bool wasConnected = WiFi.status() == WL_CONNECTED;
+  // Log WiFi connects and drops on the USB serial monitor.
+  static bool wasConnected = false;
   bool connected = WiFi.status() == WL_CONNECTED;
-  if (connected && !wasConnected)
-    Serial.printf("WiFi connected: http://%s/\n", WiFi.localIP().toString().c_str());
-  wasConnected = connected;
+  if (connected != wasConnected)
+  {
+    if (connected)
+      Serial.printf("WiFi connected to %s, sending to %s:%u\n", WIFI_SSID,
+                    WiFi.gatewayIP().toString().c_str(), RECEIVER_PORT);
+    else
+      Serial.println("WiFi disconnected, reconnecting...");
+    wasConnected = connected;
+  }
 
   // No NMEA data at all after 5 s means the GPS is not wired or powered.
   if (!gpsWarningSent && millis() > 5000 && gps.charsProcessed() < 10)
@@ -367,7 +350,9 @@ void loop()
     lastReport = millis();
     AirQuality aq = calculateAirQuality();
     updateGPS();
-    latestReport = buildReport(aq);
-    Serial.println(latestReport); // also printed on USB for debugging
+    String report = buildReport(aq);
+    bool sent = sendToReceiver(report);
+    Serial.print(sent ? "Sent: " : "Not sent: "); // USB log for debugging
+    Serial.println(report);
   }
 }
