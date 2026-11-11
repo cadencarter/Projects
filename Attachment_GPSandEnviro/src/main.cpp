@@ -4,20 +4,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
-#include <TinyGPSPlus.h>
-
-// WIFI_SSID and WIFI_PASS of the receiving ESP32's access point. This file
-// is not committed; copy include/WiFi_Info.example.h to include/WiFi_Info.h
-// and fill it in.
 #include "WiFi_Info.h"
-
-// Readings are sent as UDP packets to the receiving ESP32. It runs the WiFi
-// access point, so it is the gateway of the network this board joins
-// (192.168.4.1 by default) and no IP address needs to be set here.
-// The receiver must listen on this port.
-static const uint16_t RECEIVER_PORT = 4210;
-
-WiFiUDP udp;
 
 Adafruit_BME680 bme;
 static bool bmeOk = false;
