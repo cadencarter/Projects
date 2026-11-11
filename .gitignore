@@ -6,6 +6,3 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-
-# Secrets
-/include/WiFi_Info.h
