@@ -5,9 +5,6 @@
 #include <Adafruit_BME680.h>
 #include <TinyGPSPlus.h>
 
-const char *WIFI_SSID = "MyLight";
-const char *WIFI_PASS = "12345678";
-
 Adafruit_BME680 bme;
 static bool bmeOk = false;
 
@@ -61,8 +58,8 @@ struct AirQuality
   float gasKOhms;     // gas resistance in kOhms
 };
 
-static const float HUM_REFERENCE = 40.0f;           // ideal relative humidity (%)
-static const float HUM_WEIGHT = 0.25f;              // humidity share of the score
+static const float HUM_REFERENCE = 40.0f;                    // ideal relative humidity (%)
+static const float HUM_WEIGHT = 0.25f;                       // humidity share of the score
 static const unsigned long BURN_IN_MS = 5UL * 60UL * 1000UL; // 5 minutes
 
 static float gasBaseline = 0.0f;
@@ -73,12 +70,18 @@ static bool burnInDone = false;
 
 static const char *iaqRating(float iaq)
 {
-  if (iaq <= 50)  return "Excellent";
-  if (iaq <= 100) return "Good";
-  if (iaq <= 150) return "Lightly polluted";
-  if (iaq <= 200) return "Moderately polluted";
-  if (iaq <= 250) return "Heavily polluted";
-  if (iaq <= 350) return "Severely polluted";
+  if (iaq <= 50)
+    return "Excellent";
+  if (iaq <= 100)
+    return "Good";
+  if (iaq <= 150)
+    return "Lightly polluted";
+  if (iaq <= 200)
+    return "Moderately polluted";
+  if (iaq <= 250)
+    return "Heavily polluted";
+  if (iaq <= 350)
+    return "Severely polluted";
   return "Hazardous";
 }
 
