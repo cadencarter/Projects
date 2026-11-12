@@ -4,9 +4,6 @@
 #include <WiFiUdp.h>
 #include "index_html.h"
 
-#define togglePin 4
-#define high 1
-#define low 0
 
 const char *AP_SSID = "SSID";
 const char *AP_PASS = "password"; // at least 8 characters
@@ -28,32 +25,38 @@ const unsigned long LIGHT_TIMEOUT_MS = 6UL * 1000UL; // 6 seconds
 int lightMode = 0;
 unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 
-// ---- Attachment detection ----
-// Both attachments plug into the USB-C port and are identified by an ID
-// resistor from a USB-C pin to GND. The hub has a reference resistor from
-// that pin to 3.3 V, so the voltage on ID_PIN tells us the resistance:
-//   3.3V -- R_REF -- ID_PIN -- R_ID (in attachment) -- GND
-// R_REF must be set to that resistor's value; with 0 nothing can be
-// detected. The light gets its mode changes over USB-C; the GPS +
-// environment attachment sends its readings over WiFi.
+// ---- Attachment detection (USB-C) ----
+// Attachments plug into the DevKit's native "USB" port (not "COM"). That port
+// only reaches two ESP32 pins, used here as plain digital pins, not for USB:
+//   D- = GPIO19, D+ = GPIO20
+// Both pins use the ESP32's internal pull-up resistors, so an unconnected line
+// reads HIGH and a line with a resistor to GND reads LOW:
+//   D-    D+
+//   LOW   LOW   -> light (D- and D+ both reach GND through its resistors)
+//   HIGH  LOW   -> GPS + environment (resistor from D+ to GND, D- left open)
+//   HIGH  HIGH  -> nothing plugged in
+//   LOW   HIGH  -> not a known attachment (check wiring)
+// The pins can't be used to measure voltage here: they are on ADC2, which
+// doesn't work while WiFi is on. Plain HIGH/LOW reads work fine.
+// The internal pull-ups are weak (~45 kOhm), so detection never turns on the
+// light's optocoupler.
 //
-// Troubleshooting: every 2 s the serial monitor prints what the hub
-// measures and why it picked (or didn't pick) an attachment. The same
-// information is on the web page under "Troubleshooting".
-#define ID_PIN 5                // ADC pin wired to the USB-C ID line
-const float R_REF = 220.0;      // reference resistor in the hub (ohms)
-const float R_LIGHT = 440.0;    // ID resistor in the light attachment
-const float R_GPS_ENV = 550.0;  // ID resistor in the GPS + environment attachment
-const float R_TOLERANCE = 0.20; // accept +/- 20%
+// Serial must stay on the "COM" port (no ARDUINO_USB_CDC_ON_BOOT), because
+// the native USB port's pins are used for the attachments.
+#define USB_DM_PIN 19 // D-
+#define USB_DP_PIN 20 // D+ (also presses the lamp's button, see pressButton)
 
-float idResistance = 0;  // last measured ID resistance in ohms (0 = none)
-uint32_t idMillivolts = 0;     // average voltage on ID_PIN
-uint32_t idMinMv = 0, idMaxMv = 0; // spread of the samples (noise check)
+// A new pattern must be read this many times in a row (250 ms apart)
+// before the attachment changes, so plugging in doesn't flicker.
+const int DETECT_STABLE_READS = 3;
+
+bool dmHigh = true, dpHigh = true; // last pin readings
 const char *attachment = "none";
 String detectReason = "Starting up";
 
 // ---- GPS + environment attachment ----
-// It joins this access point and sends one JSON reading every 3 s by UDP.
+// Its own ESP32 joins this access point and sends one JSON reading every 3 s
+// by UDP.
 const uint16_t ATTACHMENT_UDP_PORT = 4210; // must match RECEIVER_PORT in Attachment_GPSandEnviro
 WiFiUDP udp;
 String latestReading = "";
@@ -63,69 +66,63 @@ uint32_t packetsRejected = 0;
 IPAddress lastSender;
 // ------------------------------
 
-bool near(float value, float target) { return fabs(value - target) <= target * R_TOLERANCE; }
+// Puts D- and D+ back into detection mode (inputs with pull-ups).
+void releaseIdPins()
+{
+  pinMode(USB_DM_PIN, INPUT_PULLUP);
+  pinMode(USB_DP_PIN, INPUT_PULLUP);
+}
 
 void updateAttachment()
 {
-  // Average a few readings to reduce noise, and keep the spread.
-  uint32_t sum = 0;
-  idMinMv = UINT32_MAX;
-  idMaxMv = 0;
-  for (int i = 0; i < 8; i++)
-  {
-    uint32_t v = analogReadMilliVolts(ID_PIN);
-    sum += v;
-    idMinMv = min(idMinMv, v);
-    idMaxMv = max(idMaxMv, v);
-  }
-  idMillivolts = sum / 8;
+  dmHigh = digitalRead(USB_DM_PIN) == HIGH;
+  dpHigh = digitalRead(USB_DP_PIN) == HIGH;
 
-  const char *previous = attachment;
-  attachment = "none";
-  idResistance = 0;
-
-  if (R_REF <= 0)
+  const char *detected;
+  if (!dmHigh && !dpHigh)
   {
-    detectReason = "R_REF is 0 in main.cpp: set it to the hub's reference resistor (ohms) so the resistance can be worked out";
+    detected = "light";
+    detectReason = "D- and D+ are both pulled to GND: light attachment";
   }
-  else if (idMillivolts > 3200)
+  else if (dmHigh && !dpHigh)
   {
-    detectReason = String("ID pin is at 3.3 V: nothing plugged in, or the USB-C ID line isn't reaching GPIO") + ID_PIN;
+    detected = "gps_env";
+    detectReason = "Only D+ is pulled to GND: GPS + environment attachment";
   }
-  else if (idMillivolts < 30)
+  else if (dmHigh && dpHigh)
   {
-    detectReason = "ID pin is at 0 V: shorted to GND, or the pull-up resistor (R_REF) to 3.3 V isn't fitted";
+    detected = "none";
+    detectReason = "D- and D+ are both HIGH: nothing plugged in, or the cable doesn't carry D-/D+ "
+                   "(charge-only cables don't)";
   }
   else
   {
-    idResistance = R_REF * idMillivolts / (3300.0 - idMillivolts);
-    if (near(idResistance, R_LIGHT))
-    {
-      attachment = "light";
-      detectReason = "Matches the light's ID resistor";
-    }
-    else if (near(idResistance, R_GPS_ENV))
-    {
-      attachment = "gps_env";
-      detectReason = "Matches the GPS + environment ID resistor";
-    }
-    else
-    {
-      detectReason = String("Measured ") + String(idResistance, 0) + " ohm, which doesn't match any attachment";
-    }
+    detected = "none";
+    detectReason = "Only D- is pulled to GND: not a known attachment, check the wiring";
   }
 
-  if (idMaxMv - idMinMv > 200)
-    detectReason += " (reading is unstable: the pin may be floating or loosely connected)";
+  // Only switch once the same result has been read a few times in a row.
+  static const char *candidate = "none";
+  static int sameCount = 0;
+  if (strcmp(detected, candidate) == 0)
+    sameCount++;
+  else
+  {
+    candidate = detected;
+    sameCount = 1;
+  }
+  if (sameCount < DETECT_STABLE_READS || strcmp(detected, attachment) == 0)
+    return;
+
+  Serial.printf("Attachment changed: %s -> %s\n", attachment, detected);
+  attachment = detected;
 
   // A newly plugged-in lamp starts Off.
-  if (attachment != previous && strcmp(attachment, "light") == 0)
+  if (strcmp(attachment, "light") == 0)
   {
     lightMode = 0;
     lastLightPress = millis();
   }
-  if (attachment != previous)
-    Serial.printf("Attachment changed: %s -> %s\n", previous, attachment);
 }
 
 void receiveReadings()
@@ -157,14 +154,10 @@ void receiveReadings()
 // Detection details for the web page's Troubleshooting section.
 String debugJson()
 {
-  String d = "{\"id_pin\":" + String(ID_PIN);
-  d += ",\"id_mv\":" + String(idMillivolts);
-  d += ",\"id_min_mv\":" + String(idMinMv);
-  d += ",\"id_max_mv\":" + String(idMaxMv);
-  d += ",\"r_ref\":" + String(R_REF, 0);
-  d += ",\"r_light\":" + String(R_LIGHT, 0);
-  d += ",\"r_gps_env\":" + String(R_GPS_ENV, 0);
-  d += ",\"tolerance_pct\":" + String(R_TOLERANCE * 100, 0);
+  String d = "{\"dm_pin\":" + String(USB_DM_PIN);
+  d += ",\"dp_pin\":" + String(USB_DP_PIN);
+  d += ",\"dm\":\"" + String(dmHigh ? "HIGH" : "LOW") + "\"";
+  d += ",\"dp\":\"" + String(dpHigh ? "HIGH" : "LOW") + "\"";
   d += ",\"reason\":\"" + detectReason + "\"";
   d += ",\"wifi_clients\":" + String(WiFi.softAPgetStationNum());
   d += ",\"packets\":" + String(packetsReceived);
@@ -182,15 +175,8 @@ String debugJson()
 void printDiagnostics()
 {
   Serial.println("---- Attachment check ----");
-  Serial.printf("ID pin GPIO%d: %lu mV (min %lu, max %lu)\n", ID_PIN, (unsigned long)idMillivolts,
-                (unsigned long)idMinMv, (unsigned long)idMaxMv);
-  if (idResistance > 0)
-    Serial.printf("Measured resistance: %.0f ohm (R_REF = %.0f ohm)\n", idResistance, R_REF);
-  else
-    Serial.printf("Measured resistance: - (R_REF = %.0f ohm)\n", R_REF);
-  Serial.printf("Light expects %.0f-%.0f ohm, GPS + environment expects %.0f-%.0f ohm\n",
-                R_LIGHT * (1 - R_TOLERANCE), R_LIGHT * (1 + R_TOLERANCE),
-                R_GPS_ENV * (1 - R_TOLERANCE), R_GPS_ENV * (1 + R_TOLERANCE));
+  Serial.printf("D- (GPIO%d): %s   D+ (GPIO%d): %s\n", USB_DM_PIN, dmHigh ? "HIGH" : "LOW",
+                USB_DP_PIN, dpHigh ? "HIGH" : "LOW");
   Serial.printf("Result: %s - %s\n", attachment, detectReason.c_str());
   Serial.printf("WiFi: %d device(s) connected, %lu packet(s) received", WiFi.softAPgetStationNum(),
                 (unsigned long)packetsReceived);
@@ -207,9 +193,7 @@ void handleStatus()
 {
   String out = "{\"attachment\":\"";
   out += attachment;
-  out += "\",\"resistance_ohm\":";
-  out += String(idResistance, 0);
-  out += ",\"debug\":";
+  out += "\",\"debug\":";
   out += debugJson();
   if (strcmp(attachment, "gps_env") == 0 && latestReading.length())
   {
@@ -232,15 +216,26 @@ void handleState() { server.send(200, "text/plain", String(lightMode)); }
 
 #define PRESS_MS 150 // try 100-300 if the lamp doesn't respond
 
+// Presses the lamp's button by driving D+ HIGH: current flows through the
+// light's 330 ohm resistor into its optocoupler. Never drive D- HIGH: it goes
+// straight to the optocoupler's LED with no resistor.
 void pressButton()
 {
-  digitalWrite(togglePin, HIGH);
+  pinMode(USB_DP_PIN, OUTPUT);
+  digitalWrite(USB_DP_PIN, HIGH);
   delay(PRESS_MS);
-  digitalWrite(togglePin, LOW);
+  digitalWrite(USB_DP_PIN, LOW);
+  releaseIdPins(); // back to detection
 }
 
 void handleToggle()
 {
+  if (strcmp(attachment, "light") != 0)
+  {
+    server.send(409, "text/plain", "No light attached");
+    return;
+  }
+
   pressButton();
 
   // 6 seconds or more since the last press: this press turns the lamp Off.
@@ -256,9 +251,10 @@ void handleToggle()
 void setup()
 {
   Serial.begin(115200);
-  pinMode(togglePin, OUTPUT);
-  digitalWrite(togglePin, LOW);
-  analogSetPinAttenuation(ID_PIN, ADC_11db); // measure the full 0-3.3 V range
+
+  // Configuring GPIO19/20 as normal pins disconnects the chip's USB hardware
+  // from them (done by the ESP-IDF GPIO driver).
+  releaseIdPins();
 
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("Connect to Wi-Fi '");
@@ -273,12 +269,6 @@ void setup()
   server.begin();
 
   udp.begin(ATTACHMENT_UDP_PORT);
-
-  // The two ID ranges overlap: a reading in the overlap is treated as the light.
-  if (R_LIGHT * (1 + R_TOLERANCE) >= R_GPS_ENV * (1 - R_TOLERANCE) &&
-      R_GPS_ENV * (1 + R_TOLERANCE) >= R_LIGHT * (1 - R_TOLERANCE))
-    Serial.println("Warning: the light and GPS + environment ID resistor ranges overlap. "
-                   "Use resistor values further apart or a smaller R_TOLERANCE.");
 }
 
 void loop()
