@@ -334,7 +334,10 @@
 
       <!-- Nothing plugged in -->
       <div id="none" hidden>
-        <p>Plug an attachment into the USB-C port.</p>
+        <p>
+          Plug the light into the USB-C port, or turn on the GPS &amp;
+          environment attachment.
+        </p>
       </div>
 
       <p id="msg" role="status"></p>
@@ -476,13 +479,15 @@
           ).json();
           showAttachment(s.attachment);
           const r = s.resistance_ohm
-            ? " (" + Math.round(s.resistance_ohm / 100) / 10 + " kΩ)"
+            ? " (" + Math.round(s.resistance_ohm) + " Ω)"
             : "";
           set(
             "sub",
-            s.attachment === "none"
-              ? "Nothing detected on USB-C"
-              : "Detected on USB-C" + r,
+            s.attachment === "light"
+              ? "Connected by USB-C" + r
+              : s.attachment === "gps_env"
+                ? "Connected over WiFi"
+                : "No attachment connected",
           );
           if (s.attachment === "gps_env") showGpsEnv(s.data, s.age_ms);
         } catch (e) {
