@@ -41,7 +41,7 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 // measures and why it picked (or didn't pick) an attachment. The same
 // information is on the web page under "Troubleshooting".
 #define ID_PIN 5                // ADC pin wired to the USB-C ID line
-const float R_REF = 0.0;        // reference resistor in the hub (ohms)
+const float R_REF = 220.0;      // reference resistor in the hub (ohms)
 const float R_LIGHT = 440.0;    // ID resistor in the light attachment
 const float R_GPS_ENV = 550.0;  // ID resistor in the GPS + environment attachment
 const float R_TOLERANCE = 0.20; // accept +/- 20%
