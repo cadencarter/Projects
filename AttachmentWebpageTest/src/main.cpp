@@ -35,11 +35,11 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 //   3.3V -- R_REF -- ID_PIN -- R_ID (in attachment) -- GND
 // Set these to your resistor values. The measured resistance is printed on
 // the serial monitor every few seconds to help with this.
-#define ID_PIN 5                 // ADC pin wired to the USB-C ID line
-const float R_REF = 10000.0;     // reference resistor in the hub (ohms)
-const float R_LIGHT = 10000.0;   // ID resistor in the light attachment
-const float R_GPS_ENV = 22000.0; // ID resistor in the GPS + environment attachment
-const float R_TOLERANCE = 0.20;  // accept +/- 20%
+#define ID_PIN 5                // ADC pin wired to the USB-C ID line
+const float R_REF = 0.0;        // reference resistor in the hub (ohms)
+const float R_LIGHT = 440.0;    // ID resistor in the light attachment
+const float R_GPS_ENV = 550.0;  // ID resistor in the GPS + environment attachment
+const float R_TOLERANCE = 0.20; // accept +/- 20%
 
 float idResistance = 0; // last measured ID resistance in ohms (0 = nothing plugged in)
 const char *attachment = "none";
