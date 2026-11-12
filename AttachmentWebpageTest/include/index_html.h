@@ -2,10 +2,9 @@
 #include <Arduino.h>
 
 // Web page for the hub. It asks /status every 2 seconds which attachment is
-// plugged in (identified by its ID resistor on the USB-C port) and shows the
-// matching panel:
-//   "light"   -> lamp panel with the toggle button (/state, /toggle)
-//   "gps_env" -> GPS + environment readings sent by the attachment over WiFi
+// connected and shows the matching panel:
+//   "light"   -> lamp panel (plugged into USB-C, found by its ID resistor)
+//   "gps_env" -> GPS + environment readings (sent by the attachment over WiFi)
 //   "none"    -> "No attachment" message
 const char PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -123,7 +122,7 @@ const char PAGE[] PROGMEM = R"rawliteral(
 
   <!-- Nothing plugged in -->
   <div id="none" hidden>
-    <p>Plug an attachment into the USB-C port.</p>
+    <p>Plug the light into the USB-C port, or turn on the GPS &amp; environment attachment.</p>
   </div>
 
   <p id="msg" role="status"></p>
@@ -239,8 +238,10 @@ const char PAGE[] PROGMEM = R"rawliteral(
     try {
       const s = await (await fetch("/status", { cache: "no-store" })).json();
       showAttachment(s.attachment);
-      const r = s.resistance_ohm ? " (" + Math.round(s.resistance_ohm / 100) / 10 + " kΩ)" : "";
-      set("sub", s.attachment === "none" ? "Nothing detected on USB-C" : "Detected on USB-C" + r);
+      const r = s.resistance_ohm ? " (" + Math.round(s.resistance_ohm) + " Ω)" : "";
+      set("sub", s.attachment === "light"   ? "Connected by USB-C" + r
+               : s.attachment === "gps_env" ? "Connected over WiFi"
+               : "No attachment connected");
       if (s.attachment === "gps_env") showGpsEnv(s.data, s.age_ms);
     } catch (e) {
       set("sub", "Not connected");
