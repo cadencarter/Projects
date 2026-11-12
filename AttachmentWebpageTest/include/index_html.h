@@ -2,10 +2,11 @@
 #include <Arduino.h>
 
 // Web page for the hub. It asks /status every 2 seconds which attachment is
-// connected and shows the matching panel:
-//   "light"   -> lamp panel (plugged into USB-C, found by its ID resistor)
-//   "gps_env" -> GPS + environment readings (sent by the attachment over WiFi)
+// plugged into USB-C (found by its ID resistor) and shows the matching panel:
+//   "light"   -> lamp panel; mode changes go over USB-C
+//   "gps_env" -> GPS + environment readings, sent by the attachment over WiFi
 //   "none"    -> "No attachment" message
+// The Troubleshooting section shows what the hub measures and why.
 const char PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -74,6 +75,14 @@ const char PAGE[] PROGMEM = R"rawliteral(
   #none p { margin:24px 0 8px; color:var(--muted); }
   #msg { margin:14px 0 0; min-height:1.5em; font-size:.875rem; color:var(--err); }
   footer { margin-top:12px; font-size:.75rem; color:var(--muted); }
+
+  /* ---- Troubleshooting ---- */
+  details { margin-top:20px; text-align:left; border-top:1px solid var(--line); padding-top:12px; }
+  summary { cursor:pointer; font-size:.875rem; color:var(--muted); font-weight:600; }
+  #dbgReason { margin:10px 0; font-size:.875rem; }
+  #dbg { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:0; font-size:.8rem; }
+  #dbg dt { color:var(--muted); font-size:.8rem; }
+  #dbg dd { font-weight:500; }
 </style>
 </head>
 <body>
@@ -122,10 +131,16 @@ const char PAGE[] PROGMEM = R"rawliteral(
 
   <!-- Nothing plugged in -->
   <div id="none" hidden>
-    <p>Plug the light into the USB-C port, or turn on the GPS &amp; environment attachment.</p>
+    <p>Plug an attachment into the USB-C port.</p>
   </div>
 
   <p id="msg" role="status"></p>
+
+  <details id="trouble">
+    <summary>Troubleshooting</summary>
+    <p id="dbgReason">–</p>
+    <dl id="dbg"></dl>
+  </details>
 </main>
 <script>
   const $ = (id) => document.getElementById(id);
@@ -234,15 +249,40 @@ const char PAGE[] PROGMEM = R"rawliteral(
     if (kind === "light") callLight("/state");
   }
 
+  // ---------- Troubleshooting ----------
+  function range(r, pct) {
+    return Math.round(r * (1 - pct / 100)) + "–" + Math.round(r * (1 + pct / 100)) + " Ω";
+  }
+  function showDebug(d, ohms) {
+    set("dbgReason", d.reason);
+    const rows = [
+      ["ID pin", "GPIO" + d.id_pin],
+      ["Voltage", d.id_mv + " mV (min " + d.id_min_mv + ", max " + d.id_max_mv + ")"],
+      ["Measured", ohms ? Math.round(ohms) + " Ω" : "–"],
+      ["R_REF", d.r_ref + " Ω"],
+      ["Light expects", range(d.r_light, d.tolerance_pct)],
+      ["GPS + env expects", range(d.r_gps_env, d.tolerance_pct)],
+      ["WiFi devices", d.wifi_clients],
+      ["Packets received", d.packets + (d.packets_rejected ? " (" + d.packets_rejected + " rejected)" : "")],
+      ["Last packet", d.last_packet_ms === null ? "never" : Math.round(d.last_packet_ms / 1000) + " s ago from " + d.last_sender],
+    ];
+    const dl = $("dbg");
+    dl.replaceChildren();
+    for (const [k, v] of rows) {
+      const dt = document.createElement("dt"); dt.textContent = k;
+      const dd = document.createElement("dd"); dd.textContent = v;
+      dl.append(dt, dd);
+    }
+  }
+
   async function poll() {
     try {
       const s = await (await fetch("/status", { cache: "no-store" })).json();
       showAttachment(s.attachment);
       const r = s.resistance_ohm ? " (" + Math.round(s.resistance_ohm) + " Ω)" : "";
-      set("sub", s.attachment === "light"   ? "Connected by USB-C" + r
-               : s.attachment === "gps_env" ? "Connected over WiFi"
-               : "No attachment connected");
+      set("sub", s.attachment === "none" ? "Nothing detected on USB-C" : "Detected on USB-C" + r);
       if (s.attachment === "gps_env") showGpsEnv(s.data, s.age_ms);
+      if (s.debug) showDebug(s.debug, s.resistance_ohm);
     } catch (e) {
       set("sub", "Not connected");
       msg.textContent = "Lost connection to the ESP32.";
