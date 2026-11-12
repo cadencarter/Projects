@@ -20,11 +20,11 @@ WebServer server(80);
 // The hub can't read the lamp's mode, so it counts button presses. The count
 // starts at 0 (Off) each time the light attachment is plugged in.
 //
-// If the button hasn't been pressed for 5 minutes, the lamp's next press
+// If the button hasn't been pressed for 5.5 seconds (half second buffer), the lamp's next press
 // turns it Off instead of moving to the next mode. Presses after that step
 // through the modes from Off again.
 #define LIGHT_MODES 6
-const unsigned long LIGHT_TIMEOUT_MS = 5UL * 60UL * 1000UL; // 5 minutes
+const unsigned long LIGHT_TIMEOUT_MS = 5.5UL * 1000UL; // 5.5 seconds
 int lightMode = 0;
 unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 
@@ -144,7 +144,7 @@ void handleToggle()
 {
   pressButton();
 
-  // 5 minutes or more since the last press: this press turns the lamp Off.
+  // 5.5 seconds or more since the last press: this press turns the lamp Off.
   if (millis() - lastLightPress >= LIGHT_TIMEOUT_MS)
     lightMode = 0;
   else
