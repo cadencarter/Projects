@@ -29,17 +29,22 @@ int lightMode = 0;
 unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 
 // ---- Attachment detection ----
-// Each attachment has an ID resistor from a USB-C pin to GND. The hub has a
-// reference resistor from that pin to 3.3 V, so the voltage on ID_PIN tells
-// us the attachment's resistance:
-//   3.3V -- R_REF -- ID_PIN -- R_ID (in attachment) -- GND
-// Set these to your resistor values. The measured resistance is printed on
-// the serial monitor every few seconds to help with this.
+// Light attachment: connected by USB-C. It has an ID resistor from a USB-C
+// pin to GND, and the hub has a reference resistor from that pin to 3.3 V,
+// so the voltage on ID_PIN tells us the attachment's resistance:
+//   3.3V -- R_REF -- ID_PIN -- R_LIGHT (in attachment) -- GND
+// R_REF must be a real resistor (not 0): with 0 ohms the pin is tied to
+// 3.3 V and nothing can ever be detected. A value close to R_LIGHT gives the
+// most accurate reading. The measured resistance is printed on the serial
+// monitor every few seconds to help with this.
+//
+// GPS + environment attachment: connected over WiFi only. It counts as
+// attached while its readings keep arriving (see GPS_ENV_TIMEOUT_MS).
 #define ID_PIN 5                // ADC pin wired to the USB-C ID line
 const float R_REF = 0.0;        // reference resistor in the hub (ohms)
 const float R_LIGHT = 440.0;    // ID resistor in the light attachment
-const float R_GPS_ENV = 550.0;  // ID resistor in the GPS + environment attachment
 const float R_TOLERANCE = 0.20; // accept +/- 20%
+const unsigned long GPS_ENV_TIMEOUT_MS = 10000; // no reading for 10 s = disconnected
 
 float idResistance = 0; // last measured ID resistance in ohms (0 = nothing plugged in)
 const char *attachment = "none";
@@ -68,10 +73,14 @@ void updateAttachment()
   else
     idResistance = R_REF * mv / (3300.0 - mv);
 
+  // The light (USB-C) takes priority; otherwise the GPS + environment
+  // attachment counts as connected while its WiFi readings are recent.
+  bool gpsEnvConnected = latestReading.length() && millis() - latestReadingAt < GPS_ENV_TIMEOUT_MS;
+
   const char *previous = attachment;
   if (idResistance > 0 && near(idResistance, R_LIGHT))
     attachment = "light";
-  else if (idResistance > 0 && near(idResistance, R_GPS_ENV))
+  else if (gpsEnvConnected)
     attachment = "gps_env";
   else
     attachment = "none";
@@ -104,7 +113,7 @@ void receiveReadings()
   }
 }
 
-// What the web page asks for every 2 s: which attachment is plugged in and,
+// What the web page asks for every 2 s: which attachment is connected and,
 // for the GPS + environment attachment, its latest reading.
 void handleStatus()
 {
