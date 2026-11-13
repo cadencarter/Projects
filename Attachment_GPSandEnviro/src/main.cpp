@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <TinyGPS++.h>
 #include "WiFi_Info.h"
 
 Adafruit_BME680 bme;
@@ -22,6 +23,9 @@ static const uint32_t GPS_BAUD = 9600;
 
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
+
+WiFiUDP udp;                                 // UDP for sending reports to the receiving ESP32
+static const uint16_t RECEIVER_PORT = 12345; // port on the receiving ESP32
 
 // How often a combined GPS + environment record is taken.
 static const unsigned long REPORT_INTERVAL_MS = 3000;
