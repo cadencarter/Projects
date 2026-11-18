@@ -91,7 +91,7 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 // Button presses run in loop() instead of inside the web request, so the page
 // gets its answer straight away and the server isn't held up. Presses asked
 // for while one is still running wait their turn.
-#define PRESS_MS 150 // how long D+ is held HIGH; try 100-300 if the lamp doesn't respond
+#define PRESS_MS 300 // how long D+ is held HIGH; raise it if the lamp misses presses
 #define PRESS_GAP_MS 150 // pause between queued presses
 int pendingPresses = 0;
 bool pressing = false;
@@ -291,6 +291,22 @@ void handleStatus()
 void handleRoot() { server.send_P(200, "text/html", PAGE); }
 void handleState() { server.send(200, "text/plain", String(lightMode)); }
 
+// The hub can't see the lamp, so if a press is missed the page gets out of
+// step. /sync?mode=N tells the hub which mode the lamp is really in, without
+// pressing the button.
+void handleSync()
+{
+  int mode = server.hasArg("mode") ? server.arg("mode").toInt() : -1;
+  if (!server.hasArg("mode") || mode < 0 || mode >= LIGHT_MODES)
+  {
+    server.send(400, "text/plain", "mode must be 0-5");
+    return;
+  }
+  Serial.printf("Light mode corrected from the page: %d -> %d\n", lightMode, mode);
+  lightMode = mode;
+  server.send(200, "text/plain", String(lightMode));
+}
+
 // Presses the lamp's button by driving D+ HIGH: current flows through the
 // light's 330 ohm resistor into its optocoupler. Never drive D- HIGH: it goes
 // straight to the optocoupler's LED with no resistor.
@@ -312,6 +328,7 @@ void updatePress()
   else if (pendingPresses > 0 && now - pressStateAt >= PRESS_GAP_MS)
   {
     pendingPresses--;
+    Serial.printf("Pressing the lamp's button (%d ms)\n", PRESS_MS);
     pinMode(USB_DP_PIN, OUTPUT);
     digitalWrite(USB_DP_PIN, HIGH);
     pressing = true;
@@ -336,6 +353,7 @@ void handleToggle()
   else
     lightMode = (lightMode + 1) % LIGHT_MODES;
   lastLightPress = millis();
+  Serial.printf("Button press requested: page now shows mode %d\n", lightMode);
 
   server.send(200, "text/plain", String(lightMode));
 }
@@ -357,6 +375,7 @@ void setup()
   server.on("/", handleRoot);
   server.on("/toggle", handleToggle);
   server.on("/state", handleState);
+  server.on("/sync", handleSync);
   server.on("/status", handleStatus);
   server.begin();
 
