@@ -50,3 +50,15 @@ test('bad JPEG, module error and stale timeout never leave an old image visible'
   assert.equal(h.elements.status.textContent,'Camera timed out');assert.equal(h.drawn.length,0);
   await h.elements.disconnect.onclick();await tick();
 });
+test('repeated Grove connection errors stay visible, and ready resumes capture',async()=>{
+  const h=harness();await h.elements.connect.onclick();
+  const err={kind:'error',message:'Cannot connect to Grove Vision AI V2. Retrying every 3 s; check I2C wiring/power.'};
+  h.send(err);await tick();await tick();
+  for(let i=0;i<10;i++){h.stale();h.send(err);await tick();await tick();}
+  assert.match(h.elements.status.textContent,/Cannot connect to Grove/);
+  h.send({kind:'ready'});await tick();await tick();
+  assert.match(h.elements.status.textContent,/connected/);
+  const before=h.writes.length;h.send(frame(1));await tick();await tick();
+  assert.match(h.elements.caption.textContent,/Capture 1/);assert.equal(h.writes.length,before+1);
+  await h.elements.disconnect.onclick();await tick();
+});
