@@ -3,7 +3,7 @@ const serialProvider = globalThis.localSerial || navigator.serial;
 const el = id => document.getElementById(id);
 const canvas = el('camera'), ctx = canvas.getContext('2d');
 let port = null, reader = null, writer = null, running = false;
-let generation = 0, lastFrameAt = 0, lastImage = null, lastFrame = null, renderQueue = Promise.resolve();
+let generation = 0, lastFrameAt = 0, lastMessageAt = 0, pending = false, lastImage = null, lastFrame = null, renderQueue = Promise.resolve();
 function status(text) { el('status').textContent = text; }
 function clearFrame(text) {
   lastImage = null; lastFrame = null;
@@ -31,14 +31,22 @@ function draw() {
   }
 }
 async function requestFrame() {
-  if (running && writer) await writer.write(new TextEncoder().encode('n'));
+  if (running && writer && !pending) { pending = true; await writer.write(new TextEncoder().encode('n')); }
 }
 async function handle(message, token) {
   if (!running || token !== generation) return;
+  lastMessageAt = Date.now(); // The XIAO is alive, even if the Grove is not.
+  if (message.kind === 'ready') {
+    status('Grove Vision AI V2 connected. Waiting for the first capture.');
+    pending = false; // Firmware discards earlier requests before sending ready.
+    lastFrameAt = Date.now(); await requestFrame(); return;
+  }
   if (message.kind === 'error') {
-    status(message.message); clearFrame('Capture error; reset XIAO and reconnect.'); return;
+    pending = false;
+    status(message.message); clearFrame('Capture error; the XIAO is retrying the Grove connection.'); return;
   }
   if (message.kind !== 'frame' || !message.data) return;
+  pending = false;
   const data = message.data;
   let img = null, imageError = '';
   if (typeof data.image === 'string' && data.image.length) {
@@ -100,7 +108,7 @@ el('connect').onclick = async () => {
     port = await serialProvider.requestPort();
     await port.open({ baudRate: 115200, bufferSize: 131072 });
     reader = port.readable.getReader(); writer = port.writable.getWriter();
-    running = true; const token = ++generation; lastFrameAt = Date.now();
+    running = true; pending = false; const token = ++generation; lastFrameAt = lastMessageAt = Date.now();
     status('Connected. Waiting for the first capture (up to 15 seconds).');
     el('disconnect').disabled = false;
     readLoop(token);
@@ -114,9 +122,12 @@ el('connect').onclick = async () => {
 el('disconnect').onclick = disconnect;
 for (const id of ['overlay', 'cw', 'ch']) el(id).onchange = draw;
 setInterval(() => {
-  if (running && Date.now() - lastFrameAt > 20000) {
+  // Only report staleness when the XIAO itself has gone quiet; a device error
+  // message (e.g. the Grove is not connected) must stay visible.
+  if (running && Date.now() - lastFrameAt > 20000 && Date.now() - lastMessageAt > 20000) {
     clearFrame('No fresh camera frame for 20 seconds.');
     status('No fresh frames. Check USB/I2C, reset XIAO, then disconnect and reconnect.');
+    pending = false; requestFrame().catch(() => {});
   }
 }, 1000);
 if (!serialProvider) status('This viewer needs desktop Chrome or Edge with Web Serial. Open it at http://localhost:8000.');

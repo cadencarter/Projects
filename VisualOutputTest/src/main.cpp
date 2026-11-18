@@ -22,11 +22,9 @@ static StaticJsonDocument<16384> response;
 unsigned long lastPoll = 0;
 unsigned long sequence = 0;
 bool ready = false;
-const char *lastError = "Capture stopped. Reset XIAO to retry.";
 
 void reportError(const char *message)
 {
-  lastError = message;
   digitalWrite(ALERT_PIN, LOW);
   Serial.print("{\"kind\":\"error\",\"message\":\"");
   Serial.print(message); // Only fixed strings from this source, never module text.
@@ -135,6 +133,30 @@ bool capture()
   return false;
 }
 
+const unsigned long RECONNECT_INTERVAL_MS = 3000;
+unsigned long lastConnectAttempt = 0;
+
+// Discard viewer requests that arrived while the module was unavailable,
+// so no stale 'n' triggers a capture nobody is waiting for.
+void drainRequests()
+{
+  while (Serial.available())
+    Serial.read();
+}
+
+bool connectModule()
+{
+  lastConnectAttempt = millis();
+  if (!AI.begin())
+  {
+    reportError("Cannot connect to Grove Vision AI V2. Retrying every 3 s; check I2C wiring/power.");
+    return false;
+  }
+  drainRequests();
+  Serial.println("{\"kind\":\"ready\"}"); // Viewer requests a frame on this.
+  return true;
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -143,18 +165,21 @@ void setup()
   const unsigned long started = millis();
   while (!Serial && millis() - started < 5000)
     delay(10);
-  ready = AI.begin();
-  if (!ready)
-    reportError("Cannot connect to Grove Vision AI V2. Check I2C and reset XIAO.");
+  // The Grove module boots slower than the XIAO when both power up together.
+  delay(1500);
+  ready = connectModule();
 }
 
 void loop()
 {
   if (!ready)
   {
-    // Repeat so a viewer connected after boot still sees the failure.
-    reportError(lastError);
-    delay(3000);
+    // Keep retrying: the Grove may finish booting or be reseated after the XIAO.
+    // Errors repeat so a viewer connected after boot still sees the failure.
+    drainRequests();
+    if (millis() - lastConnectAttempt >= RECONNECT_INTERVAL_MS)
+      ready = connectModule();
+    delay(10);
     return;
   }
   // Request/response prevents unbounded USB buffering. Viewer requests 'n'.
@@ -170,5 +195,9 @@ void loop()
   if (elapsed < POLL_INTERVAL_MS)
     delay(POLL_INTERVAL_MS - elapsed);
   lastPoll = millis();
-  ready = capture(); // Stop on errors: never pair a late event with a new request.
+  // On a capture error, reconnect (AT+ID resynchronises the module and the
+  // library discards any late event) instead of requiring a manual reset.
+  ready = capture();
+  if (!ready)
+    lastConnectAttempt = millis();
 }

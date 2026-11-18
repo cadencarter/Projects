@@ -34,12 +34,17 @@ class Camera:
                             result = json.loads(line)
                         except (ValueError, UnicodeDecodeError):
                             continue  # Boot log lines are not camera messages.
-                        if isinstance(result, dict) and result.get('kind') in ('frame', 'error'):
-                            if result['kind'] == 'error':
-                                self.failed = result.get('message', 'Camera error')
+                        if not isinstance(result, dict):
+                            continue
+                        if result.get('kind') == 'ready':
+                            # The firmware discarded our request while reconnecting.
+                            self.usb.write(b'n')
+                            deadline = time.monotonic() + 18
+                        elif result.get('kind') in ('frame', 'error'):
+                            # Device errors are not latched: the firmware retries itself.
                             return result
-                raise TimeoutError('No camera response. Reset XIAO and restart this server.')
-            except (OSError, serial.SerialException, ValueError, TimeoutError) as error:
+                return {'kind': 'error', 'message': 'No camera response within 18 s. Check the XIAO USB connection.'}
+            except (OSError, serial.SerialException, ValueError) as error:
                 self.failed = str(error)
                 return {'kind': 'error', 'message': self.failed}
 
