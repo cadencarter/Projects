@@ -48,6 +48,10 @@ const char PAGE[] PROGMEM = R"rawliteral(
                           animation:blink 0.6s steps(1, end) infinite; }
   @keyframes blink { 50% { background:var(--off); box-shadow:none; } }
   #state { font-size:1.1rem; font-weight:600; margin-bottom:20px; }
+  .sync { margin-top:12px; font-size:.875rem; color:var(--muted); }
+  .sync label { display:block; margin-bottom:6px; }
+  .sync select { width:100%; padding:10px; font:inherit; color:var(--ink); background:var(--panel);
+                 border:1px solid var(--line); border-radius:8px; }
   button { width:100%; padding:12px; font:inherit; font-weight:600; cursor:pointer; color:#fff;
            background:var(--on); border:0; border-radius:8px; }
   @media (prefers-color-scheme: dark) { button { color:#0b1411; } }
@@ -95,6 +99,18 @@ const char PAGE[] PROGMEM = R"rawliteral(
     <div id="lamp" class="lamp"></div>
     <div id="state" aria-live="polite">Unknown</div>
     <button id="btn">Next light mode</button>
+    <div class="sync">
+      <label for="syncSel">Lamp doesn't match? Choose what it's really showing:</label>
+      <select id="syncSel">
+        <option value="">Choose…</option>
+        <option value="0">Off</option>
+        <option value="1">Spotlight</option>
+        <option value="2">Floodlight</option>
+        <option value="3">Ultra Bright</option>
+        <option value="4">Red Light</option>
+        <option value="5">Flashing Red Light</option>
+      </select>
+    </div>
   </div>
 
   <!-- GPS + environment attachment -->
@@ -212,6 +228,24 @@ const char PAGE[] PROGMEM = R"rawliteral(
     }
   }
   btn.addEventListener("click", pressLight);
+
+  // Corrects the hub's idea of the lamp's mode without pressing the button.
+  const syncSel = $("syncSel");
+  syncSel.addEventListener("change", async () => {
+    if (syncSel.value === "" || lightBusy) return;
+    lightBusy = true;
+    btn.disabled = syncSel.disabled = true;
+    try {
+      const r = await fetchWithTimeout("/sync?mode=" + syncSel.value, 4000);
+      msg.textContent = (r.ok && showLight(await r.text())) ? "" : "The hub couldn't update the light mode.";
+    } catch (e) {
+      msg.textContent = "Lost connection to the ESP32.";
+    } finally {
+      syncSel.value = "";
+      btn.disabled = syncSel.disabled = false;
+      lightBusy = false;
+    }
+  });
 
   // ---------- GPS + environment ----------
   const fmt = (v, digits, unit) => (v === null || v === undefined) ? "–" : Number(v).toFixed(digits) + unit;
