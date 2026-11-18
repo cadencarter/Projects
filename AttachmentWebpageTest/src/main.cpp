@@ -4,11 +4,73 @@
 #include <WiFiUdp.h>
 #include "index_html.h"
 
-
 const char *AP_SSID = "SSID";
 const char *AP_PASS = "password"; // at least 8 characters
 
+// ---- Web server ----
+// The ESP32 WebServer library serves one connection at a time. When a browser
+// opens a connection and doesn't send a request on it straight away (Chrome
+// often opens spare connections in advance), the library keeps waiting on it
+// for up to 5 s, and every other request - including button presses - waits
+// behind it. This version gives up on such connections after
+// IDLE_CONNECTION_WAIT_MS instead. It copies WebServer::handleClient() from
+// ESP32 Arduino core 2.x (what PlatformIO's espressif32 platform uses), so on
+// core 3.x it falls back to the normal WebServer.
+const unsigned long IDLE_CONNECTION_WAIT_MS = 300;
+
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+class FastWebServer : public WebServer
+{
+public:
+  using WebServer::WebServer;
+
+  void handleClient() override
+  {
+    if (_currentStatus == HC_NONE)
+    {
+      _currentClient = _server.available();
+      if (!_currentClient)
+      {
+        if (_nullDelay)
+          delay(1);
+        return;
+      }
+      _currentStatus = HC_WAIT_READ;
+      _statusChange = millis();
+    }
+
+    bool keepCurrentClient = false;
+    if (_currentClient.connected() && _currentStatus == HC_WAIT_READ)
+    {
+      if (_currentClient.available())
+      {
+        if (_parseRequest(_currentClient))
+        {
+          _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
+          _contentLength = CONTENT_LENGTH_NOT_SET;
+          _handleRequest();
+        }
+      }
+      else if (millis() - _statusChange <= IDLE_CONNECTION_WAIT_MS)
+      {
+        keepCurrentClient = true; // give the browser a moment to send the request
+        yield();
+      }
+    }
+
+    if (!keepCurrentClient)
+    {
+      _currentClient = WiFiClient();
+      _currentStatus = HC_NONE;
+      _currentUpload.reset();
+      _currentRaw.reset();
+    }
+  }
+};
+FastWebServer server(80);
+#else
 WebServer server(80);
+#endif
 
 // ---- Light attachment ----
 // The lamp has one button that steps through its modes in this order, back
@@ -24,6 +86,15 @@ WebServer server(80);
 const unsigned long LIGHT_TIMEOUT_MS = 6UL * 1000UL; // 6 seconds
 int lightMode = 0;
 unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
+
+// Button presses run in loop() instead of inside the web request, so the page
+// gets its answer straight away and the server isn't held up. Presses asked
+// for while one is still running wait their turn.
+#define PRESS_MS 150 // how long D+ is held HIGH; try 100-300 if the lamp doesn't respond
+#define PRESS_GAP_MS 150 // pause between queued presses
+int pendingPresses = 0;
+bool pressing = false;
+unsigned long pressStateAt = 0; // when the current press (or gap) started
 
 // ---- Attachment detection (USB-C) ----
 // Attachments plug into the DevKit's native "USB" port (not "COM"). That port
@@ -44,7 +115,7 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 // Serial must stay on the "COM" port (no ARDUINO_USB_CDC_ON_BOOT), because
 // the native USB port's pins are used for the attachments.
 #define USB_DM_PIN 19 // D-
-#define USB_DP_PIN 20 // D+ (also presses the lamp's button, see pressButton)
+#define USB_DP_PIN 20 // D+ (also presses the lamp's button, see updatePress)
 
 // A new pattern must be read this many times in a row (250 ms apart)
 // before the attachment changes, so plugging in doesn't flicker.
@@ -75,6 +146,11 @@ void releaseIdPins()
 
 void updateAttachment()
 {
+  // D+ is driven HIGH during a press, so the pins can't be read until all
+  // queued presses are done.
+  if (pressing || pendingPresses > 0)
+    return;
+
   dmHigh = digitalRead(USB_DM_PIN) == HIGH;
   dpHigh = digitalRead(USB_DP_PIN) == HIGH;
 
@@ -214,18 +290,32 @@ void handleStatus()
 void handleRoot() { server.send_P(200, "text/html", PAGE); }
 void handleState() { server.send(200, "text/plain", String(lightMode)); }
 
-#define PRESS_MS 150 // try 100-300 if the lamp doesn't respond
-
 // Presses the lamp's button by driving D+ HIGH: current flows through the
 // light's 330 ohm resistor into its optocoupler. Never drive D- HIGH: it goes
 // straight to the optocoupler's LED with no resistor.
-void pressButton()
+// Called from loop(): starts the next queued press, and ends it after
+// PRESS_MS without blocking anything else.
+void updatePress()
 {
-  pinMode(USB_DP_PIN, OUTPUT);
-  digitalWrite(USB_DP_PIN, HIGH);
-  delay(PRESS_MS);
-  digitalWrite(USB_DP_PIN, LOW);
-  releaseIdPins(); // back to detection
+  unsigned long now = millis();
+  if (pressing)
+  {
+    if (now - pressStateAt >= PRESS_MS)
+    {
+      digitalWrite(USB_DP_PIN, LOW);
+      releaseIdPins(); // back to detection
+      pressing = false;
+      pressStateAt = now; // start of the gap before the next press
+    }
+  }
+  else if (pendingPresses > 0 && now - pressStateAt >= PRESS_GAP_MS)
+  {
+    pendingPresses--;
+    pinMode(USB_DP_PIN, OUTPUT);
+    digitalWrite(USB_DP_PIN, HIGH);
+    pressing = true;
+    pressStateAt = now;
+  }
 }
 
 void handleToggle()
@@ -236,7 +326,7 @@ void handleToggle()
     return;
   }
 
-  pressButton();
+  pendingPresses++; // pressed by updatePress() within a few milliseconds
 
   // 6 seconds or more since the last press: this press turns the lamp Off.
   if (millis() - lastLightPress >= LIGHT_TIMEOUT_MS)
@@ -274,6 +364,7 @@ void setup()
 void loop()
 {
   server.handleClient();
+  updatePress();
   receiveReadings();
 
   static unsigned long lastCheck = 0, lastPrint = 0;

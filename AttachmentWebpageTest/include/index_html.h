@@ -156,26 +156,62 @@ const char PAGE[] PROGMEM = R"rawliteral(
   // ---------- Light ----------
   const lamp = $("lamp"), stateEl = $("state"), btn = $("btn");
   const LIGHT_STATES = ["Off", "Spotlight", "Floodlight", "Ultra Bright", "Red Light", "Flashing Red Light"];
+  let lightBusy = false; // a press (or state check) is in progress
+
+  // Gives up on a request after `ms` so one stuck request can't freeze the page.
+  async function fetchWithTimeout(path, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      return await fetch(path, { cache: "no-store", signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Shows the mode number sent by the hub. Returns false if it isn't one.
   function showLight(text) {
-    let level = parseInt(text.trim(), 10);
-    if (!(level >= 0 && level < LIGHT_STATES.length)) level = 0;
+    const level = parseInt(text.trim(), 10);
+    if (!(level >= 0 && level < LIGHT_STATES.length)) return false;
     lamp.classList.toggle("on", level > 0);
     lamp.dataset.level = level;
     stateEl.textContent = LIGHT_STATES[level];
+    return true;
   }
-  async function callLight(path) {
-    btn.disabled = true;
+
+  // Asks the hub which mode it thinks the lamp is in.
+  async function syncLight() {
     try {
-      const r = await fetch(path);
-      showLight(await r.text());
-      msg.textContent = "";
+      const r = await fetchWithTimeout("/state", 4000);
+      return r.ok && showLight(await r.text());
     } catch (e) {
-      msg.textContent = "Lost connection to the ESP32.";
-    } finally {
-      btn.disabled = false;
+      return false;
     }
   }
-  btn.addEventListener("click", () => callLight("/toggle"));
+
+  async function pressLight() {
+    if (lightBusy) return;
+    lightBusy = true;
+    btn.disabled = true;
+    try {
+      const r = await fetchWithTimeout("/toggle", 4000);
+      const text = await r.text();
+      if (r.ok && showLight(text)) msg.textContent = "";
+      else if (r.status === 409) msg.textContent = "The hub doesn't see the light plugged in, so it didn't press the button.";
+      else msg.textContent = "The hub couldn't change the light (" + r.status + ").";
+    } catch (e) {
+      // The press may still have happened, so never send it again
+      // automatically: just ask the hub what it now thinks the mode is.
+      msg.textContent = "No reply from the hub. Checking the light's state…";
+      msg.textContent = (await syncLight())
+        ? "The reply got lost; this is the hub's current light mode."
+        : "Lost connection to the ESP32.";
+    } finally {
+      btn.disabled = false;
+      lightBusy = false;
+    }
+  }
+  btn.addEventListener("click", pressLight);
 
   // ---------- GPS + environment ----------
   const fmt = (v, digits, unit) => (v === null || v === undefined) ? "–" : Number(v).toFixed(digits) + unit;
@@ -246,7 +282,7 @@ const char PAGE[] PROGMEM = R"rawliteral(
     set("title", a.title);
     for (const k in ATTACHMENTS) $(ATTACHMENTS[k].panel).hidden = (k !== kind);
     msg.textContent = "";
-    if (kind === "light") callLight("/state");
+    if (kind === "light") syncLight();
   }
 
   // ---------- Troubleshooting ----------
@@ -270,16 +306,24 @@ const char PAGE[] PROGMEM = R"rawliteral(
     }
   }
 
+  // Only one status request at a time, and none while a button press is in
+  // progress: the hub answers one request at a time, so the press goes first.
+  let polling = false;
   async function poll() {
+    if (polling || lightBusy) return;
+    polling = true;
     try {
-      const s = await (await fetch("/status", { cache: "no-store" })).json();
+      const s = await (await fetchWithTimeout("/status", 4000)).json();
       showAttachment(s.attachment);
+      if (msg.textContent === "Lost connection to the ESP32.") msg.textContent = "";
       set("sub", s.attachment === "none" ? "Nothing detected on USB-C" : "Detected on USB-C");
       if (s.attachment === "gps_env") showGpsEnv(s.data, s.age_ms);
       if (s.debug) showDebug(s.debug);
     } catch (e) {
       set("sub", "Not connected");
       msg.textContent = "Lost connection to the ESP32.";
+    } finally {
+      polling = false;
     }
   }
   poll();
