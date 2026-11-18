@@ -92,18 +92,30 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 // gets its answer straight away and the server isn't held up. Presses asked
 // for while one is still running wait their turn.
 //
-// The optocoupler only pulls the lamp's button line down weakly. That's
-// enough while the lamp is on, but after it has sat Off for a while it
-// misses short presses, so the first press from Off is held longer.
-#define PRESS_MS 300       // normal press: how long D+ is held HIGH
-#define WAKE_PRESS_MS 800  // first press after the lamp has been Off for LIGHT_TIMEOUT_MS
+// The lamp ignores the hub's very first press after the light is plugged in
+// (a longer press didn't help). So that first click on the page sends two
+// presses: a wake-up press, then after WAKE_GAP_MS the press that turns it
+// on. The gap is long enough that the lamp doesn't treat them as a
+// double-click. Later clicks send one press each.
+#define PRESS_MS 300       // how long D+ is held HIGH for each press
 #define PRESS_GAP_MS 150   // pause between queued presses
+#define WAKE_GAP_MS 1000   // pause between the wake-up press and the real one
 #define MAX_QUEUED_PRESSES 8
-unsigned int pressQueue[MAX_QUEUED_PRESSES]; // durations (ms) of presses waiting to run
+struct QueuedPress
+{
+  unsigned int gapBeforeMs; // wait this long after the previous press
+  bool wake;                // wake-up press (for the serial log)
+};
+QueuedPress pressQueue[MAX_QUEUED_PRESSES];
+bool firstPressSincePlugIn = true; // set again each time the light is plugged in
 int pendingPresses = 0;
 bool pressing = false;
-unsigned int currentPressMs = PRESS_MS;
 unsigned long pressStateAt = 0; // when the current press (or gap) started
+
+void queuePress(unsigned int gapBeforeMs, bool wake)
+{
+  pressQueue[pendingPresses++] = {gapBeforeMs, wake};
+}
 
 // ---- Attachment detection (USB-C) ----
 // Attachments plug into the DevKit's native "USB" port (not "COM"). That port
@@ -207,6 +219,7 @@ void updateAttachment()
   {
     lightMode = 0;
     lastLightPress = millis();
+    firstPressSincePlugIn = true;
   }
 }
 
@@ -325,7 +338,7 @@ void updatePress()
   unsigned long now = millis();
   if (pressing)
   {
-    if (now - pressStateAt >= currentPressMs)
+    if (now - pressStateAt >= PRESS_MS)
     {
       digitalWrite(USB_DP_PIN, LOW);
       releaseIdPins(); // back to detection
@@ -333,13 +346,14 @@ void updatePress()
       pressStateAt = now; // start of the gap before the next press
     }
   }
-  else if (pendingPresses > 0 && now - pressStateAt >= PRESS_GAP_MS)
+  else if (pendingPresses > 0 && now - pressStateAt >= pressQueue[0].gapBeforeMs)
   {
-    currentPressMs = pressQueue[0];
+    bool wake = pressQueue[0].wake;
     for (int i = 1; i < pendingPresses; i++)
       pressQueue[i - 1] = pressQueue[i];
     pendingPresses--;
-    Serial.printf("Pressing the lamp's button (%u ms)\n", currentPressMs);
+    lastLightPress = now; // the lamp's 6-second timer starts from its real last press
+    Serial.printf("Pressing the lamp's button%s (%d ms)\n", wake ? " (wake-up)" : "", PRESS_MS);
     pinMode(USB_DP_PIN, OUTPUT);
     digitalWrite(USB_DP_PIN, HIGH);
     pressing = true;
@@ -355,25 +369,35 @@ void handleToggle()
     return;
   }
 
-  if (pendingPresses >= MAX_QUEUED_PRESSES)
+  if (pendingPresses > MAX_QUEUED_PRESSES - 2)
   {
     server.send(503, "text/plain", "Too many presses waiting");
     return;
   }
 
-  bool idle = millis() - lastLightPress >= LIGHT_TIMEOUT_MS;
+  // Idle: no press waiting or running, and 6 seconds or more since the lamp's
+  // last press.
+  bool idle = pendingPresses == 0 && !pressing && millis() - lastLightPress >= LIGHT_TIMEOUT_MS;
 
-  // Queue the press; updatePress() runs it within a few milliseconds. The
-  // first press after the lamp has sat Off is held longer so it registers.
-  pressQueue[pendingPresses++] = (lightMode == 0 && idle) ? WAKE_PRESS_MS : PRESS_MS;
+  // Queue the press(es); updatePress() starts them within a few milliseconds.
+  if (firstPressSincePlugIn && lightMode == 0)
+  {
+    queuePress(0, true);            // wake-up press, ignored by the lamp
+    queuePress(WAKE_GAP_MS, false); // turns it on to Spotlight
+    firstPressSincePlugIn = false;
+  }
+  else
+  {
+    queuePress(PRESS_GAP_MS, false);
+  }
 
   // Lamp on and 6 seconds or more since the last press: this press turns it
-  // Off. From Off, a press always goes to Spotlight (handled below).
+  // Off. From Off, a click always goes to Spotlight (handled below).
   if (lightMode != 0 && idle)
     lightMode = 0;
   else
     lightMode = (lightMode + 1) % LIGHT_MODES;
-  lastLightPress = millis();
+  lastLightPress = millis(); // updated again when each press really happens
   Serial.printf("Button press requested: page now shows mode %d\n", lightMode);
 
   server.send(200, "text/plain", String(lightMode));
