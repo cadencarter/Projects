@@ -91,10 +91,18 @@ unsigned long lastLightPress = 0; // millis() of the last press (or plug-in)
 // Button presses run in loop() instead of inside the web request, so the page
 // gets its answer straight away and the server isn't held up. Presses asked
 // for while one is still running wait their turn.
-#define PRESS_MS 300 // how long D+ is held HIGH; raise it if the lamp misses presses
-#define PRESS_GAP_MS 150 // pause between queued presses
+//
+// The optocoupler only pulls the lamp's button line down weakly. That's
+// enough while the lamp is on, but after it has sat Off for a while it
+// misses short presses, so the first press from Off is held longer.
+#define PRESS_MS 300       // normal press: how long D+ is held HIGH
+#define WAKE_PRESS_MS 800  // first press after the lamp has been Off for LIGHT_TIMEOUT_MS
+#define PRESS_GAP_MS 150   // pause between queued presses
+#define MAX_QUEUED_PRESSES 8
+unsigned int pressQueue[MAX_QUEUED_PRESSES]; // durations (ms) of presses waiting to run
 int pendingPresses = 0;
 bool pressing = false;
+unsigned int currentPressMs = PRESS_MS;
 unsigned long pressStateAt = 0; // when the current press (or gap) started
 
 // ---- Attachment detection (USB-C) ----
@@ -310,14 +318,14 @@ void handleSync()
 // Presses the lamp's button by driving D+ HIGH: current flows through the
 // light's 330 ohm resistor into its optocoupler. Never drive D- HIGH: it goes
 // straight to the optocoupler's LED with no resistor.
-// Called from loop(): starts the next queued press, and ends it after
-// PRESS_MS without blocking anything else.
+// Called from loop(): starts the next queued press, and ends it after its
+// duration without blocking anything else.
 void updatePress()
 {
   unsigned long now = millis();
   if (pressing)
   {
-    if (now - pressStateAt >= PRESS_MS)
+    if (now - pressStateAt >= currentPressMs)
     {
       digitalWrite(USB_DP_PIN, LOW);
       releaseIdPins(); // back to detection
@@ -327,8 +335,11 @@ void updatePress()
   }
   else if (pendingPresses > 0 && now - pressStateAt >= PRESS_GAP_MS)
   {
+    currentPressMs = pressQueue[0];
+    for (int i = 1; i < pendingPresses; i++)
+      pressQueue[i - 1] = pressQueue[i];
     pendingPresses--;
-    Serial.printf("Pressing the lamp's button (%d ms)\n", PRESS_MS);
+    Serial.printf("Pressing the lamp's button (%u ms)\n", currentPressMs);
     pinMode(USB_DP_PIN, OUTPUT);
     digitalWrite(USB_DP_PIN, HIGH);
     pressing = true;
@@ -344,11 +355,21 @@ void handleToggle()
     return;
   }
 
-  pendingPresses++; // pressed by updatePress() within a few milliseconds
+  if (pendingPresses >= MAX_QUEUED_PRESSES)
+  {
+    server.send(503, "text/plain", "Too many presses waiting");
+    return;
+  }
+
+  bool idle = millis() - lastLightPress >= LIGHT_TIMEOUT_MS;
+
+  // Queue the press; updatePress() runs it within a few milliseconds. The
+  // first press after the lamp has sat Off is held longer so it registers.
+  pressQueue[pendingPresses++] = (lightMode == 0 && idle) ? WAKE_PRESS_MS : PRESS_MS;
 
   // Lamp on and 6 seconds or more since the last press: this press turns it
   // Off. From Off, a press always goes to Spotlight (handled below).
-  if (lightMode != 0 && millis() - lastLightPress >= LIGHT_TIMEOUT_MS)
+  if (lightMode != 0 && idle)
     lightMode = 0;
   else
     lightMode = (lightMode + 1) % LIGHT_MODES;
